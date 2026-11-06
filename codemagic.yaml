@@ -25,9 +25,13 @@ workflows:
           app_delegate = Path('ios/Runner/AppDelegate.swift')
           info = Path('ios/Runner/Info.plist')
 
-          if not podfile.exists() or not project.exists() or not app_delegate.exists():
-              raise SystemExit('iOS platform files are missing. On Windows run: flutter create --platforms=ios --org com.kiarash .')
+         if not project.exists() or not app_delegate.exists():
+    raise SystemExit('Required iOS platform files are missing.')
 
+if not podfile.exists():
+    print('Swift Package Manager detected. Skipping Podfile configuration.')
+if podfile.exists():
+    # Existing Podfile configuration
           pod_text = podfile.read_text()
           platform_line = "platform :ios, '15.0'"
           pattern = r"^\s*#?\s*platform\s*:ios\s*,\s*['\"][^'\"]+['\"].*$"
