@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:file_picker/file_picker.dart';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -181,15 +183,64 @@ class TaskItem {
     this.reminderAt,
     this.isDone = false,
     this.category = 'شخصی',
+    this.repeatWeekdays = const [],
+    this.completedDates = const [],
+    this.occurrenceDate,
   });
 
   final int id;
   final String title;
+  /// For a recurring task, this is the first active date of the series.
   final DateTime date;
   final DateTime createdAt;
   final DateTime? reminderAt;
   final bool isDone;
   final String category;
+  /// DateTime.weekday values: Monday = 1 ... Sunday = 7.
+  final List<int> repeatWeekdays;
+  /// Completion dates for recurring tasks, stored as yyyy-MM-dd.
+  final List<String> completedDates;
+  /// Temporary calendar projection; it is never saved to JSON.
+  final DateTime? occurrenceDate;
+
+  bool get isRecurring => repeatWeekdays.isNotEmpty;
+  DateTime get displayDate => occurrenceDate ?? date;
+
+  bool occursOn(DateTime value) {
+    final day = _dateOnly(value);
+    if (day.isBefore(_dateOnly(date))) return false;
+    if (!isRecurring) return DateUtils.isSameDay(date, day);
+    return repeatWeekdays.contains(day.weekday);
+  }
+
+  bool isDoneOn(DateTime value) {
+    if (!isRecurring) return isDone;
+    return completedDates.contains(_dateKey(value));
+  }
+
+  TaskItem forDate(DateTime value) {
+    final day = _dateOnly(value);
+    final reminder = reminderAt == null
+        ? null
+        : DateTime(day.year, day.month, day.day, reminderAt!.hour, reminderAt!.minute);
+    return copyWith(
+      isDone: isDoneOn(day),
+      reminderAt: reminder,
+      occurrenceDate: day,
+    );
+  }
+
+  TaskItem withOccurrenceDone(DateTime value, bool done) {
+    final dates = completedDates.toSet();
+    final key = _dateKey(value);
+    if (done) {
+      dates.add(key);
+    } else {
+      dates.remove(key);
+    }
+    final sorted = dates.toList()..sort();
+    return copyWith(completedDates: sorted);
+  }
 
   TaskItem copyWith({
     String? title,
@@ -198,6 +249,9 @@ class TaskItem {
     bool clearReminder = false,
     bool? isDone,
     String? category,
+    List<int>? repeatWeekdays,
+    List<String>? completedDates,
+    DateTime? occurrenceDate,
   }) {
     return TaskItem(
       id: id,
@@ -207,6 +261,9 @@ class TaskItem {
       reminderAt: clearReminder ? null : (reminderAt ?? this.reminderAt),
       isDone: isDone ?? this.isDone,
       category: category ?? this.category,
+      repeatWeekdays: repeatWeekdays ?? this.repeatWeekdays,
+      completedDates: completedDates ?? this.completedDates,
+      occurrenceDate: occurrenceDate ?? this.occurrenceDate,
     );
   }
 
@@ -218,10 +275,25 @@ class TaskItem {
         'reminderAt': reminderAt?.toIso8601String(),
         'isDone': isDone,
         'category': category,
+        'repeatWeekdays': repeatWeekdays,
+        'completedDates': completedDates,
       };
 
   factory TaskItem.fromJson(Map<String, dynamic> json) {
     final now = DateTime.now();
+    final weekdays = ((json['repeatWeekdays'] as List<dynamic>?) ?? const [])
+        .whereType<num>()
+        .map((value) => value.toInt())
+        .where((day) => day >= 1 && day <= 7)
+        .toSet()
+        .toList()
+      ..sort();
+    final completed = ((json['completedDates'] as List<dynamic>?) ?? const [])
+        .whereType<String>()
+        .toSet()
+        .toList()
+      ..sort();
+
     return TaskItem(
       id: (json['id'] as num).toInt(),
       title: json['title'] as String? ?? 'کار بدون عنوان',
@@ -230,8 +302,137 @@ class TaskItem {
       reminderAt: DateTime.tryParse(json['reminderAt'] as String? ?? ''),
       isDone: json['isDone'] as bool? ?? false,
       category: json['category'] as String? ?? 'شخصی',
+      repeatWeekdays: weekdays,
+      completedDates: completed,
     );
   }
+}
+
+class RoozPlanImport {
+  const RoozPlanImport({required this.title, required this.tasks});
+
+  final String title;
+  final List<TaskItem> tasks;
+
+  factory RoozPlanImport.parse(String source) {
+    final decoded = jsonDecode(source);
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException('ساختار فایل باید یک شیء JSON باشد.');
+    }
+    if (decoded['format'] != 'rooz' || decoded['version'] != 1) {
+      throw const FormatException('فرمت یا نسخهٔ فایل Rooz پشتیبانی نمی‌شود.');
+    }
+    final rawTasks = decoded['tasks'];
+    if (rawTasks is! List || rawTasks.isEmpty) {
+      throw const FormatException('فایل هیچ کاری برای واردکردن ندارد.');
+    }
+    if (rawTasks.length > 1000) {
+      throw const FormatException('حداکثر ۱۰۰۰ کار را می‌توان در یک فایل وارد کرد.');
+    }
+
+    final rootCalendar = (decoded['calendar'] as String? ?? 'gregorian').toLowerCase();
+    final tasks = <TaskItem>[];
+    for (var index = 0; index < rawTasks.length; index++) {
+      final raw = rawTasks[index];
+      if (raw is! Map<String, dynamic>) {
+        throw FormatException('ساختار کار شمارهٔ ${index + 1} معتبر نیست.');
+      }
+      final title = (raw['title'] as String? ?? '').trim();
+      if (title.isEmpty) {
+        throw FormatException('عنوان کار شمارهٔ ${index + 1} خالی است.');
+      }
+
+      final dateValue = raw['date'] ?? raw['startDate'];
+      if (dateValue is! String || dateValue.trim().isEmpty) {
+        throw FormatException('تاریخ کار «$title» مشخص نشده است.');
+      }
+      final calendar = (raw['calendar'] as String? ?? rootCalendar).toLowerCase();
+      final date = _parseRoozDate(dateValue, calendar);
+      final weekdays = _parseRoozWeekdays(raw['repeatWeekdays']);
+      final timeValue = raw['reminderTime'] ?? raw['time'];
+      DateTime? reminder;
+      if (timeValue != null) {
+        if (timeValue is! String || !RegExp(r'^\d{1,2}:\d{2}$').hasMatch(timeValue)) {
+          throw FormatException('ساعت یادآوری کار «$title» معتبر نیست.');
+        }
+        final parts = timeValue.split(':').map(int.parse).toList();
+        if (parts[0] < 0 || parts[0] > 23 || parts[1] < 0 || parts[1] > 59) {
+          throw FormatException('ساعت یادآوری کار «$title» خارج از محدوده است.');
+        }
+        reminder = DateTime(date.year, date.month, date.day, parts[0], parts[1]);
+      }
+
+      final categoryValue = raw['category'];
+      final category = categoryValue is String && categoryValue.trim().isNotEmpty
+          ? categoryValue.trim()
+          : 'شخصی';
+
+      tasks.add(TaskItem(
+        id: index + 1,
+        title: title,
+        date: date,
+        createdAt: DateTime.now(),
+        reminderAt: reminder,
+        category: category,
+        repeatWeekdays: weekdays,
+      ));
+    }
+    return RoozPlanImport(
+      title: (decoded['title'] as String? ?? 'برنامهٔ واردشده').trim(),
+      tasks: tasks,
+    );
+  }
+}
+
+DateTime _parseRoozDate(String value, String calendar) {
+  final normalized = value
+      .replaceAll('۰', '0').replaceAll('۱', '1').replaceAll('۲', '2')
+      .replaceAll('۳', '3').replaceAll('۴', '4').replaceAll('۵', '5')
+      .replaceAll('۶', '6').replaceAll('۷', '7').replaceAll('۸', '8')
+      .replaceAll('۹', '9');
+  final match = RegExp(r'^(\d{4})-(\d{1,2})-(\d{1,2})$').firstMatch(normalized);
+  if (match == null) throw FormatException('تاریخ «$value» باید به شکل YYYY-MM-DD باشد.');
+  final year = int.parse(match.group(1)!);
+  final month = int.parse(match.group(2)!);
+  final day = int.parse(match.group(3)!);
+  try {
+    if (calendar == 'jalali') {
+      return _dateOnly(Jalali(year, month, day).toDateTime());
+    }
+    if (calendar != 'gregorian') {
+      throw FormatException('تقویم «$calendar» پشتیبانی نمی‌شود.');
+    }
+    final result = DateTime(year, month, day);
+    if (result.year != year || result.month != month || result.day != day) {
+      throw FormatException('تاریخ «$value» معتبر نیست.');
+    }
+    return _dateOnly(result);
+  } on RangeError {
+    throw FormatException('تاریخ «$value» معتبر نیست.');
+  }
+}
+
+List<int> _parseRoozWeekdays(dynamic value) {
+  if (value == null) return const [];
+  if (value is! List) throw const FormatException('repeatWeekdays باید یک آرایه باشد.');
+  const names = <String, int>{
+    'monday': 1, 'mon': 1, 'دوشنبه': 1,
+    'tuesday': 2, 'tue': 2, 'سه شنبه': 2, 'سه‌شنبه': 2,
+    'wednesday': 3, 'wed': 3, 'چهارشنبه': 3,
+    'thursday': 4, 'thu': 4, 'پنجشنبه': 4, 'پنج شنبه': 4,
+    'friday': 5, 'fri': 5, 'جمعه': 5,
+    'saturday': 6, 'sat': 6, 'شنبه': 6,
+    'sunday': 7, 'sun': 7, 'یکشنبه': 7, 'یک شنبه': 7,
+  };
+  final result = <int>{};
+  for (final item in value) {
+    final day = item is num ? item.toInt() : names[item.toString().trim().toLowerCase()];
+    if (day == null || day < 1 || day > 7) {
+      throw FormatException('روز تکرار «$item» معتبر نیست؛ از ۱ تا ۷ یا نام روز استفاده کن.');
+    }
+    result.add(day);
+  }
+  return result.toList()..sort();
 }
 
 class TaskStore {
@@ -323,34 +524,75 @@ class ReminderService {
     return false;
   }
 
+  int _weeklyNotificationId(int taskId, int weekday) {
+    final mixed = (taskId ^ (weekday * 0x45d9f3b)) & 0x7fffffff;
+    return mixed == taskId ? (mixed + 1) & 0x7fffffff : mixed;
+  }
+
+  DateTime? _nextWeeklyDate(TaskItem task, int weekday) {
+    final reminder = task.reminderAt;
+    if (reminder == null) return null;
+    final now = DateTime.now();
+    for (var offset = 0; offset <= 14; offset++) {
+      final day = _dateOnly(task.date).add(Duration(days: offset));
+      if (day.weekday != weekday) continue;
+      final candidate = DateTime(day.year, day.month, day.day, reminder.hour, reminder.minute);
+      if (candidate.isAfter(now)) return candidate;
+    }
+    return null;
+  }
+
   Future<bool> schedule(TaskItem task) async {
-    if (!supported || task.reminderAt == null || task.isDone) return false;
-    final when = task.reminderAt!;
-    if (!when.isAfter(DateTime.now())) return false;
+    if (!supported || task.reminderAt == null) return false;
+    if (!task.isRecurring && task.isDone) return false;
     try {
       await initialize();
       if (!_ready) return false;
       final permissionGranted = await requestPermission();
       if (!permissionGranted) return false;
+
+      const details = NotificationDetails(
+        android: AndroidNotificationDetails(
+          'rooz_task_reminders',
+          'یادآوری کارها',
+          channelDescription: 'اعلان زمان‌بندی‌شده برای کارهای روزانه',
+          importance: Importance.high,
+          priority: Priority.high,
+        ),
+        iOS: DarwinNotificationDetails(
+          presentAlert: true,
+          presentBadge: true,
+          presentSound: true,
+        ),
+      );
+
+      if (task.isRecurring) {
+        var scheduledAny = false;
+        for (final weekday in task.repeatWeekdays) {
+          final when = _nextWeeklyDate(task, weekday);
+          if (when == null) continue;
+          await _plugin.zonedSchedule(
+            id: _weeklyNotificationId(task.id, weekday),
+            title: 'یادآوری کار',
+            body: task.title,
+            scheduledDate: tz.TZDateTime.from(when, tz.local),
+            notificationDetails: details,
+            androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+            matchDateTimeComponents: DateTimeComponents.dayOfWeekAndTime,
+          );
+          scheduledAny = true;
+        }
+        return scheduledAny;
+      }
+
+      final when = task.reminderAt!;
+      if (!when.isAfter(DateTime.now())) return false;
       await _plugin.zonedSchedule(
         id: task.id,
         title: 'یادآوری کار',
         body: task.title,
         scheduledDate: tz.TZDateTime.from(when, tz.local),
-        notificationDetails: const NotificationDetails(
-          android: AndroidNotificationDetails(
-            'rooz_task_reminders',
-            'یادآوری کارها',
-            channelDescription: 'اعلان زمان‌بندی‌شده برای کارهای روزانه',
-            importance: Importance.high,
-            priority: Priority.high,
-          ),
-          iOS: DarwinNotificationDetails(
-            presentAlert: true,
-            presentBadge: true,
-            presentSound: true,
-          ),
-        ),
+        notificationDetails: details,
         androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
       );
       return true;
@@ -365,6 +607,13 @@ class ReminderService {
       await initialize();
       if (_ready) await _plugin.cancel(id: id);
     } catch (_) {}
+  }
+
+  Future<void> cancelTask(TaskItem task) async {
+    await cancel(task.id);
+    for (final weekday in task.repeatWeekdays) {
+      await cancel(_weeklyNotificationId(task.id, weekday));
+    }
   }
 }
 
@@ -470,8 +719,12 @@ class _HomeShellState extends State<HomeShell> {
       _selectedDate = result.date;
     });
     await _persist();
-    await ReminderService.instance.cancel(result.id);
-    if (result.reminderAt != null && !result.isDone) {
+    if (task != null) {
+      await ReminderService.instance.cancelTask(task);
+    } else {
+      await ReminderService.instance.cancel(result.id);
+    }
+    if (result.reminderAt != null && (result.isRecurring || !result.isDone)) {
       final scheduled = await ReminderService.instance.schedule(result);
       if (!scheduled && mounted && !kIsWeb) {
         _message('کار ذخیره شد، اما اعلان تنظیم نشد. دسترسی اعلان‌ها را در تنظیمات بررسی کن.');
@@ -482,7 +735,20 @@ class _HomeShellState extends State<HomeShell> {
   Future<void> _toggleTask(TaskItem task) async {
     final index = _tasks.indexWhere((item) => item.id == task.id);
     if (index < 0) return;
-    final updated = task.copyWith(isDone: !task.isDone);
+    final master = _tasks[index];
+
+    if (master.isRecurring) {
+      final occurrenceDate = task.occurrenceDate ?? task.date;
+      final updated = master.withOccurrenceDone(
+        occurrenceDate,
+        !master.isDoneOn(occurrenceDate),
+      );
+      setState(() => _tasks[index] = updated);
+      await _persist();
+      return;
+    }
+
+    final updated = master.copyWith(isDone: !master.isDone);
     setState(() => _tasks[index] = updated);
     await _persist();
     if (updated.isDone) {
@@ -492,6 +758,134 @@ class _HomeShellState extends State<HomeShell> {
       if (!scheduled && mounted && !kIsWeb) {
         _message('وضعیت کار ذخیره شد، اما اعلان دوباره تنظیم نشد.');
       }
+    }
+  }
+
+  int _newTaskId(Set<int> reserved) {
+    var candidate = DateTime.now().microsecondsSinceEpoch.remainder(0x7fffffff);
+    while (candidate == 0 || reserved.contains(candidate)) {
+      candidate = (candidate + 1) & 0x7fffffff;
+    }
+    reserved.add(candidate);
+    return candidate;
+  }
+
+  String _importKey(TaskItem task) =>
+      '${task.title.trim().toLowerCase()}|${_dateKey(task.date)}|${task.repeatWeekdays.join(',')}';
+
+  Future<void> _importRoozPlan() async {
+    try {
+      final file = await FilePicker.pickFile(
+        type: FileType.custom,
+        allowedExtensions: ['rooz'],
+      );
+      if (file == null) return;
+      final bytes = await file.readAsBytes();
+      if (bytes.length > 2 * 1024 * 1024) {
+        _message('حجم فایل بیشتر از ۲ مگابایت است.');
+        return;
+      }
+
+      final plan = RoozPlanImport.parse(utf8.decode(bytes));
+      final existingKeys = _tasks.map(_importKey).toSet();
+      final seenKeys = <String>{};
+      final unique = <TaskItem>[];
+      var duplicateCount = 0;
+      for (final task in plan.tasks) {
+        final key = _importKey(task);
+        if (existingKeys.contains(key) || !seenKeys.add(key)) {
+          duplicateCount++;
+        } else {
+          unique.add(task);
+        }
+      }
+
+      final dateList = unique.map((task) => task.date).toList()..sort();
+      final dateSummary = dateList.isEmpty
+          ? 'همهٔ موارد فایل قبلاً وجود دارند.'
+          : 'از ${_shortDate(dateList.first)} تا ${_shortDate(dateList.last)}';
+      if (!mounted) return;
+
+      final accepted = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: Text(plan.title, maxLines: 2, overflow: TextOverflow.ellipsis),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('${_fa(unique.length)} کار جدید آمادهٔ ورود است.'),
+                const SizedBox(height: 5),
+                Text(dateSummary, style: TextStyle(color: _muted(context), fontSize: 11)),
+                if (duplicateCount > 0) ...[
+                  const SizedBox(height: 5),
+                  Text('${_fa(duplicateCount)} مورد تکراری نادیده گرفته می‌شود.',
+                      style: const TextStyle(color: _amber, fontSize: 11)),
+                ],
+                const SizedBox(height: 12),
+                Flexible(
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: unique.length.clamp(0, 8).toInt(),
+                    separatorBuilder: (_, _) => const Divider(height: 1),
+                    itemBuilder: (_, index) {
+                      final task = unique[index];
+                      final repeat = task.isRecurring ? ' • هفتگی' : '';
+                      return ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        title: Text(task.title, maxLines: 1, overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+                        subtitle: Text('${_shortDate(task.date)}$repeat', style: const TextStyle(fontSize: 10)),
+                      );
+                    },
+                  ),
+                ),
+                if (unique.length > 8)
+                  Text('و ${_fa(unique.length - 8)} کار دیگر...',
+                      style: TextStyle(color: _muted(context), fontSize: 10)),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('انصراف'),
+            ),
+            FilledButton(
+              onPressed: unique.isEmpty ? null : () => Navigator.pop(dialogContext, true),
+              child: const Text('واردکردن'),
+            ),
+          ],
+        ),
+      );
+      if (accepted != true || unique.isEmpty) return;
+
+      final reserved = _tasks.map((task) => task.id).toSet();
+      final imported = unique.map((task) => TaskItem(
+        id: _newTaskId(reserved),
+        title: task.title,
+        date: task.date,
+        createdAt: DateTime.now(),
+        reminderAt: task.reminderAt,
+        category: task.category,
+        repeatWeekdays: task.repeatWeekdays,
+      )).toList();
+
+      setState(() => _tasks = [..._tasks, ...imported]);
+      await _persist();
+      for (final task in imported) {
+        if (task.reminderAt != null) {
+          await ReminderService.instance.schedule(task);
+        }
+      }
+      _message('${_fa(imported.length)} کار به برنامه اضافه شد.');
+    } on FormatException catch (error) {
+      _message('فایل Rooz معتبر نیست: ${error.message}');
+    } catch (error) {
+      _message('خواندن فایل با خطا روبه‌رو شد. دوباره امتحان کن.');
     }
   }
 
@@ -516,7 +910,7 @@ class _HomeShellState extends State<HomeShell> {
     if (confirmed != true) return;
     setState(() => _tasks.removeWhere((item) => item.id == task.id));
     await _persist();
-    await ReminderService.instance.cancel(task.id);
+    await ReminderService.instance.cancelTask(task);
   }
 
   Future<void> _clearAllTasks() async {
@@ -540,7 +934,7 @@ class _HomeShellState extends State<HomeShell> {
     );
     if (confirmed != true) return;
     for (final task in _tasks) {
-      await ReminderService.instance.cancel(task.id);
+      await ReminderService.instance.cancelTask(task);
     }
     setState(() => _tasks.clear());
     await _store.clear();
@@ -605,6 +999,7 @@ class _HomeShellState extends State<HomeShell> {
                         onThemeChanged: widget.onThemeChanged,
                         onRemindersDefaultChanged: widget.onRemindersDefaultChanged,
                         onRequestNotifications: _askNotificationPermission,
+                        onImportPlan: _importRoozPlan,
                         onClearAll: _clearAllTasks,
                         taskCount: _tasks.length,
                       ),
@@ -685,7 +1080,10 @@ class TodayPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final dayTasks = tasks.where((task) => DateUtils.isSameDay(task.date, selectedDate)).toList()
+    final dayTasks = tasks
+        .where((task) => task.occursOn(selectedDate))
+        .map((task) => task.forDate(selectedDate))
+        .toList()
       ..sort(_taskSort);
     final done = dayTasks.where((task) => task.isDone).length;
     final progress = dayTasks.isEmpty ? 0.0 : done / dayTasks.length;
@@ -838,7 +1236,7 @@ class _QuickDateStrip extends StatelessWidget {
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
         itemCount: 7,
-        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
         itemBuilder: (context, index) {
           final date = firstDay.add(Duration(days: index));
           final selected = DateUtils.isSameDay(date, selectedDate);
@@ -1071,10 +1469,12 @@ class CalendarPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final selectedTasks = tasks.where((task) => DateUtils.isSameDay(task.date, selectedDate)).toList()
+    final selectedTasks = tasks
+        .where((task) => task.occursOn(selectedDate))
+        .map((task) => task.forDate(selectedDate))
+        .toList()
       ..sort(_taskSort);
     final selectedJalali = Jalali.fromDateTime(selectedDate);
-    final theme = Theme.of(context);
 
     return CustomScrollView(
       physics: const BouncingScrollPhysics(),
@@ -1219,7 +1619,7 @@ class _CalendarGrid extends StatelessWidget {
         final dateTime = _dateOnly(date.toDateTime());
         final selected = DateUtils.isSameDay(dateTime, selectedDate);
         final isToday = date.year == now.year && date.month == now.month && date.day == now.day;
-        final count = tasks.where((task) => DateUtils.isSameDay(task.date, dateTime)).length;
+        final count = tasks.where((task) => task.occursOn(dateTime)).length;
         return Material(
           color: selected ? _accent : Colors.transparent,
           borderRadius: BorderRadius.circular(13),
@@ -1315,10 +1715,11 @@ class InsightsPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final daily = List<DailyCount>.generate(month.monthLength, (index) {
       final day = index + 1;
-      final dayTasks = tasks.where((task) {
-        final value = Jalali.fromDateTime(task.date);
-        return value.year == month.year && value.month == month.month && value.day == day;
-      }).toList();
+      final dateTime = _dateOnly(Jalali(month.year, month.month, day).toDateTime());
+      final dayTasks = tasks
+          .where((task) => task.occursOn(dateTime))
+          .map((task) => task.forDate(dateTime))
+          .toList();
       return DailyCount(
         day: day,
         total: dayTasks.length,
@@ -1664,6 +2065,7 @@ class SettingsPage extends StatelessWidget {
     required this.onThemeChanged,
     required this.onRemindersDefaultChanged,
     required this.onRequestNotifications,
+    required this.onImportPlan,
     required this.onClearAll,
     required this.taskCount,
   });
@@ -1673,6 +2075,7 @@ class SettingsPage extends StatelessWidget {
   final ValueChanged<ThemeMode> onThemeChanged;
   final ValueChanged<bool> onRemindersDefaultChanged;
   final VoidCallback onRequestNotifications;
+  final VoidCallback onImportPlan;
   final VoidCallback onClearAll;
   final int taskCount;
 
@@ -1738,6 +2141,14 @@ class SettingsPage extends StatelessWidget {
           title: 'داده‌ها',
           children: [
             ListTile(
+              onTap: onImportPlan,
+              leading: const Icon(Icons.file_open_outlined, color: _accent),
+              title: const Text('واردکردن برنامه از فایل', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800)),
+              subtitle: Text('فایل .rooz ساخته‌شده با ChatGPT را انتخاب کن.', style: TextStyle(color: _muted(context), fontSize: 10)),
+              trailing: const Icon(Icons.chevron_left_rounded),
+            ),
+            Divider(height: 1, indent: 15, endIndent: 15, color: scheme.outline),
+            ListTile(
               leading: const Icon(Icons.storage_outlined),
               title: const Text('ذخیره‌سازی روی دستگاه', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800)),
               subtitle: Text('${_fa(taskCount)} کار در حافظهٔ محلی برنامه ثبت شده است.', style: TextStyle(color: _muted(context), fontSize: 10)),
@@ -1763,7 +2174,7 @@ class SettingsPage extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               Text('روز', style: TextStyle(color: _text(context), fontSize: 15, fontWeight: FontWeight.w900)),
-              Text('نسخهٔ ۱.۱.۰  •  برنامه‌ریزی ساده و متمرکز', style: TextStyle(color: _muted(context), fontSize: 10)),
+              Text('نسخهٔ ۱.۲.۰  •  برنامه‌ریزی ساده و متمرکز', style: TextStyle(color: _muted(context), fontSize: 10)),
             ],
           ),
         ),
@@ -1894,6 +2305,8 @@ class TaskCard extends StatelessWidget {
                       crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
                         _TaskMeta(icon: Icons.label_outline_rounded, label: task.category, color: categoryColor),
+                        if (task.isRecurring)
+                          _TaskMeta(icon: Icons.repeat_rounded, label: 'هفتگی', color: _muted(context)),
                         if (task.reminderAt != null)
                           _TaskMeta(icon: Icons.notifications_none_rounded, label: _time(task.reminderAt!), color: _muted(context)),
                       ],
@@ -2012,9 +2425,16 @@ class _TaskEditorSheetState extends State<TaskEditorSheet> {
   late TimeOfDay _time;
   late bool _reminderEnabled;
   late String _category;
+  late bool _repeatEnabled;
+  late Set<int> _repeatWeekdays;
   String? _validationError;
 
   static const List<String> _categories = ['شخصی', 'مطالعه', 'کار', 'سلامت'];
+  static const List<int> _weekdayOrder = [6, 7, 1, 2, 3, 4, 5];
+  static const Map<int, String> _weekdayLabels = {
+    6: 'شنبه', 7: 'یکشنبه', 1: 'دوشنبه', 2: 'سه‌شنبه',
+    3: 'چهارشنبه', 4: 'پنجشنبه', 5: 'جمعه',
+  };
 
   @override
   void initState() {
@@ -2026,6 +2446,8 @@ class _TaskEditorSheetState extends State<TaskEditorSheet> {
     _time = TimeOfDay(hour: initialReminder.hour, minute: initialReminder.minute);
     _reminderEnabled = !kIsWeb && (task?.reminderAt != null || (task == null && widget.remindersDefault));
     _category = task != null && _categories.contains(task.category) ? task.category : 'شخصی';
+    _repeatEnabled = task?.isRecurring ?? false;
+    _repeatWeekdays = {...?task?.repeatWeekdays};
   }
 
   @override
@@ -2047,6 +2469,13 @@ class _TaskEditorSheetState extends State<TaskEditorSheet> {
     if (picked != null) setState(() => _date = _dateOnly(picked.toDateTime()));
   }
 
+  void _applyRepeatPreset(Set<int> days) {
+    setState(() {
+      _repeatEnabled = true;
+      _repeatWeekdays = {...days};
+    });
+  }
+
   Future<void> _chooseTime() async {
     final picked = await showTimePicker(
       context: context,
@@ -2062,10 +2491,14 @@ class _TaskEditorSheetState extends State<TaskEditorSheet> {
       setState(() => _validationError = 'عنوان کار را وارد کن.');
       return;
     }
+    if (_repeatEnabled && _repeatWeekdays.isEmpty) {
+      setState(() => _validationError = 'حداقل یک روز برای تکرار انتخاب کن.');
+      return;
+    }
     DateTime? reminder;
     if (_reminderEnabled) {
       reminder = DateTime(_date.year, _date.month, _date.day, _time.hour, _time.minute);
-      if (!reminder.isAfter(DateTime.now())) {
+      if (!_repeatEnabled && !reminder.isAfter(DateTime.now())) {
         setState(() => _validationError = 'زمان یادآوری باید در آینده باشد.');
         return;
       }
@@ -2080,6 +2513,8 @@ class _TaskEditorSheetState extends State<TaskEditorSheet> {
       reminderAt: reminder,
       isDone: old?.isDone ?? false,
       category: _category,
+      repeatWeekdays: _repeatEnabled ? (_repeatWeekdays.toList()..sort()) : const [],
+      completedDates: _repeatEnabled ? (old?.completedDates ?? const []) : const [],
     );
     Navigator.pop(context, result);
   }
@@ -2144,10 +2579,61 @@ class _TaskEditorSheetState extends State<TaskEditorSheet> {
               const SizedBox(height: 15),
               _EditorOption(
                 icon: Icons.calendar_today_outlined,
-                title: 'تاریخ انجام',
+                title: 'تاریخ شروع',
                 value: _shortDate(_date),
                 onTap: _chooseDate,
               ),
+              SwitchListTile.adaptive(
+                contentPadding: EdgeInsets.zero,
+                value: _repeatEnabled,
+                onChanged: (value) => setState(() {
+                  _repeatEnabled = value;
+                  if (value && _repeatWeekdays.isEmpty) {
+                    _repeatWeekdays = {_date.weekday};
+                  }
+                }),
+                activeTrackColor: _accent,
+                title: const Text('تکرار هفتگی', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w800)),
+                subtitle: Text('این کار در روزهای انتخابی هر هفته تکرار می‌شود.',
+                    style: TextStyle(color: _muted(context), fontSize: 10)),
+              ),
+              if (_repeatEnabled) ...[
+                Padding(
+                  padding: const EdgeInsets.only(top: 3, bottom: 9),
+                  child: Text('روزهای تکرار', style: TextStyle(color: _muted(context), fontSize: 11, fontWeight: FontWeight.w800)),
+                ),
+                Wrap(
+                  spacing: 7,
+                  runSpacing: 7,
+                  children: _weekdayOrder.map((weekday) {
+                    final selected = _repeatWeekdays.contains(weekday);
+                    return FilterChip(
+                      label: Text(_weekdayLabels[weekday]!),
+                      selected: selected,
+                      showCheckmark: false,
+                      selectedColor: _accentSoft,
+                      onSelected: (value) => setState(() {
+                        if (value) {
+                          _repeatWeekdays.add(weekday);
+                        } else {
+                          _repeatWeekdays.remove(weekday);
+                        }
+                      }),
+                      labelStyle: TextStyle(color: selected ? _accent : _muted(context), fontSize: 10, fontWeight: FontWeight.w700),
+                      side: BorderSide(color: selected ? _accent.withValues(alpha: .35) : Theme.of(context).colorScheme.outline),
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 5),
+                Wrap(
+                  spacing: 4,
+                  children: [
+                    TextButton(onPressed: () => _applyRepeatPreset({6, 7, 1, 2, 3}), child: const Text('روزهای کاری', style: TextStyle(fontSize: 10))),
+                    TextButton(onPressed: () => _applyRepeatPreset({4, 5}), child: const Text('پنجشنبه و جمعه', style: TextStyle(fontSize: 10))),
+                    TextButton(onPressed: () => _applyRepeatPreset({6, 7, 1, 2, 3, 4, 5}), child: const Text('هر روز', style: TextStyle(fontSize: 10))),
+                  ],
+                ),
+              ],
               SwitchListTile.adaptive(
                 contentPadding: EdgeInsets.zero,
                 value: _reminderEnabled,
@@ -2364,7 +2850,7 @@ class _JalaliDatePickerDialogState extends State<JalaliDatePickerDialog> {
 
 int _taskSort(TaskItem a, TaskItem b) {
   if (a.isDone != b.isDone) return a.isDone ? 1 : -1;
-  final byDate = a.date.compareTo(b.date);
+  final byDate = a.displayDate.compareTo(b.displayDate);
   if (byDate != 0) return byDate;
   if (a.reminderAt == null && b.reminderAt != null) return 1;
   if (a.reminderAt != null && b.reminderAt == null) return -1;
@@ -2373,6 +2859,9 @@ int _taskSort(TaskItem a, TaskItem b) {
 }
 
 DateTime _dateOnly(DateTime value) => DateTime(value.year, value.month, value.day);
+
+String _dateKey(DateTime value) =>
+    '${value.year.toString().padLeft(4, '0')}-${value.month.toString().padLeft(2, '0')}-${value.day.toString().padLeft(2, '0')}';
 
 String _fa(Object value) {
   const english = '0123456789';
