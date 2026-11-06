@@ -1,0 +1,82 @@
+workflows:
+  rooz-ios-unsigned:
+    name: Rooz iOS unsigned IPA
+    max_build_duration: 120
+    instance_type: mac_mini_m2
+    environment:
+      flutter: 3.47.9
+      xcode: latest
+      cocoapods: default
+      vars:
+        PUB_HOSTED_URL: https://pub.flutter-io.cn
+        FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+    scripts:
+      - name: Get Flutter packages
+        script: flutter pub get
+
+      - name: Configure iOS target, app name and notifications
+        script: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          podfile = Path('ios/Podfile')
+          project = Path('ios/Runner.xcodeproj/project.pbxproj')
+          app_delegate = Path('ios/Runner/AppDelegate.swift')
+          info = Path('ios/Runner/Info.plist')
+
+          if not podfile.exists() or not project.exists() or not app_delegate.exists():
+              raise SystemExit('iOS platform files are missing. On Windows run: flutter create --platforms=ios --org com.kiarash .')
+
+          pod_text = podfile.read_text()
+          platform_line = "platform :ios, '15.0'"
+          pattern = r"^\s*#?\s*platform\s*:ios\s*,\s*['\"][^'\"]+['\"].*$"
+          if re.search(pattern, pod_text, flags=re.MULTILINE):
+              pod_text = re.sub(pattern, platform_line, pod_text, count=1, flags=re.MULTILINE)
+          else:
+              pod_text = platform_line + '\n' + pod_text
+          podfile.write_text(pod_text)
+
+          pbx = project.read_text()
+          pbx = re.sub(r'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;', 'IPHONEOS_DEPLOYMENT_TARGET = 15.0;', pbx)
+          project.write_text(pbx)
+
+          source = app_delegate.read_text()
+          if 'UNUserNotificationCenter.current().delegate' not in source:
+              if 'import UserNotifications' not in source:
+                  source = source.replace('import Flutter', 'import Flutter\nimport UserNotifications', 1)
+              marker = 'return super.application(application, didFinishLaunchingWithOptions: launchOptions)'
+              if marker not in source:
+                  raise SystemExit('Could not locate AppDelegate launch method for notification setup.')
+              source = source.replace(
+                  marker,
+                  'UNUserNotificationCenter.current().delegate = self as? UNUserNotificationCenterDelegate\n    ' + marker,
+                  1,
+              )
+              app_delegate.write_text(source)
+
+          if info.exists():
+              plist = info.read_text()
+              display_name = '<key>CFBundleDisplayName</key>\n\t<string>روز</string>'
+              if '<key>CFBundleDisplayName</key>' in plist:
+                  plist = re.sub(r'<key>CFBundleDisplayName</key>\s*<string>.*?</string>', display_name, plist, count=1, flags=re.DOTALL)
+              else:
+                  plist = plist.replace('<dict>', '<dict>\n\t' + display_name, 1)
+              info.write_text(plist)
+          print('Configured iOS 15+, app display name and local notification delegate.')
+          PY
+
+      - name: Build release app without Apple signing
+        script: flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        script: |
+          mkdir -p build/ios/ipa/Payload
+          ditto build/ios/iphoneos/Runner.app build/ios/ipa/Payload/Runner.app
+          cd build/ios/ipa
+          /usr/bin/zip -qry -y Rooz-unsigned.ipa Payload
+
+    artifacts:
+      - build/ios/ipa/Rooz-unsigned.ipa
+      - build/ios/iphoneos/Runner.app
+      - /tmp/xcodebuild_logs/*.log
